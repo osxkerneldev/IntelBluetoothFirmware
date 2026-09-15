@@ -67,13 +67,21 @@ static KernelPatcher::KextInfo IntelBTPatcher_IOUsbHostInfo {
 };
 
 void *CIntelBTPatcher::_hookPipeInstance = nullptr;
-AsyncOwnerData *CIntelBTPatcher::_interruptPipeAsyncOwner = nullptr;
+IOSimpleLock *CIntelBTPatcher::_stateLock = nullptr;
+uint16_t CIntelBTPatcher::_pendingFeatureHandles[CIntelBTPatcher::kMaxPendingFeatureHandles] = {};
+uint32_t CIntelBTPatcher::_pendingFeatureHandleCount = 0;
 bool CIntelBTPatcher::_randomAddressInit = false;
 
 bool CIntelBTPatcher::init()
 {
     DBGLOG(DRV_NAME, "%s", __PRETTY_FUNCTION__);
     callbackIBTPatcher = this;
+    // Guards the pending-handle table, which is touched from USB completions.
+    // If it cannot be allocated the event rewrite simply stays disabled.
+    if (_stateLock == nullptr)
+        _stateLock = IOSimpleLockAlloc();
+    if (_stateLock == nullptr)
+        SYSLOG(DRV_NAME, "failed to allocate state lock, LE PHY workaround disabled");
     if (getKernelVersion() < KernelVersion::Monterey) {
         lilu.onKextLoadForce(&IntelBTPatcher_IOBluetoothInfo, 1,
         [](void *user, KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
@@ -91,6 +99,12 @@ bool CIntelBTPatcher::init()
 void CIntelBTPatcher::free()
 {
     DBGLOG(DRV_NAME, "%s", __PRETTY_FUNCTION__);
+    _hookPipeInstance = nullptr;
+    if (_stateLock != nullptr) {
+        IOSimpleLockFree(_stateLock);
+        _stateLock = nullptr;
+    }
+    _pendingFeatureHandleCount = 0;
 }
 
 void CIntelBTPatcher::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size)
@@ -214,29 +228,49 @@ IOReturn CIntelBTPatcher::newHostDeviceRequest(void *that, IOService *provider, 
                 length = 9;
                 if (writeHCIDescriptor == nullptr)
                     writeHCIDescriptor = IOBufferMemoryDescriptor::withBytes(randomAddressHci, 9, kIODirectionOut);
-                writeHCIDescriptor->prepare(kIODirectionOut);
-                IOReturn ret = FunctionCast(newHostDeviceRequest, callbackIBTPatcher->oldHostDeviceRequest)(that, provider, randomAddressRequest, nullptr, writeHCIDescriptor, length, nullptr, timeout);
-                writeHCIDescriptor->complete();
-                const char *randAddressDump = _hexDumpHCIData((uint8_t *)randomAddressHci, 9);
-                if (randAddressDump) {
-                    SYSLOG(DRV_NAME, "[PATCH] Sending Random Address HCI %d %s", ret, randAddressDump);
-                    IOFree((void *)randAddressDump, 9 * 3 + 1);
+                if (writeHCIDescriptor != nullptr) {
+                    writeHCIDescriptor->prepare(kIODirectionOut);
+                    IOReturn ret = FunctionCast(newHostDeviceRequest, callbackIBTPatcher->oldHostDeviceRequest)(that, provider, randomAddressRequest, nullptr, writeHCIDescriptor, length, nullptr, timeout);
+                    writeHCIDescriptor->complete();
+                    const char *randAddressDump = _hexDumpHCIData((uint8_t *)randomAddressHci, 9);
+                    if (randAddressDump) {
+                        SYSLOG(DRV_NAME, "[PATCH] Sending Random Address HCI %d %s", ret, randAddressDump);
+                        IOFree((void *)randAddressDump, 9 * 3 + 1);
+                    }
+                    _randomAddressInit = true;
+                    SYSLOG(DRV_NAME, "[PATCH] Resend LE SCAN PARAM HCI %d", ret);
+                } else {
+                    SYSLOG(DRV_NAME, "[PATCH] Failed to allocate Random Address HCI descriptor");
                 }
-                _randomAddressInit = true;
-                SYSLOG(DRV_NAME, "[PATCH] Resend LE SCAN PARAM HCI %d", ret);
             }
-        } else if (hdr->opcode == HCI_OP_LE_READ_REMOTE_FEATURES) {
-            IOReturn ret = FunctionCast(newHostDeviceRequest, callbackIBTPatcher->oldHostDeviceRequest)(that, provider, request, nullptr, descriptor, length, nullptr, timeout);
-            SYSLOG(DRV_NAME, "[PATCH] Sending extra LE Read Remote Features command %d", ret);
+        } else if (hdr->opcode == HCI_OP_LE_READ_REMOTE_FEATURES &&
+                   hdrLen >= sizeof(HciCommandHdr) + 2) {
+            // Issue a duplicate so a second Read Remote Features Complete comes
+            // back for this handle; the completion path turns that spare event
+            // into the LE PHY Update Complete that Ventura+ waits for. The
+            // request and length are copied so the caller's own call is
+            // untouched by anything the inner call writes back.
+            uint16_t connectionHandle = (uint16_t)(hdr->data[0] | (hdr->data[1] << 8));
+            StandardUSB::DeviceRequest extraRequest = request;
+            unsigned int extraLength = length;
+            IOReturn ret = FunctionCast(newHostDeviceRequest, callbackIBTPatcher->oldHostDeviceRequest)(that, provider, extraRequest, nullptr, descriptor, extraLength, nullptr, timeout);
+            if (ret == kIOReturnSuccess)
+                armFeatureHandle(connectionHandle);
+            SYSLOG(DRV_NAME, "[PATCH] Sending extra LE Read Remote Features command %d handle 0x%04x", ret, connectionHandle);
         }
     } else {
         hdr = (HciCommandHdr *)data;
-        hdrLen = request.wLength - 3;
+        // wLength counts the whole command; anything shorter than the header
+        // would underflow the unsigned subtraction below.
+        hdrLen = request.wLength >= sizeof(HciCommandHdr) ? request.wLength - (uint32_t)sizeof(HciCommandHdr) : 0;
     }
     if (hdr) {
         // HCI reset, we need to send Random address again
-        if (hdr->opcode == HCI_OP_RESET)
+        if (hdr->opcode == HCI_OP_RESET) {
             _randomAddressInit = false;
+            // Connection handles do not survive a controller reset.
+            resetFeatureHandles();
+        }
 #if DEBUG
         DBGLOG(DRV_NAME, "[%s] bRequest: 0x%x direction: %s type: %s recipient: %s wValue: 0x%02x wIndex: 0x%02x opcode: 0x%04x len: %d length: %d async: %d", provider->getName(), request.bRequest, requestDirectionNames[(request.bmRequestType & kDeviceRequestDirectionMask) >> kDeviceRequestDirectionPhase], requestRecipientNames[(request.bmRequestType & kDeviceRequestRecipientMask) >> kDeviceRequestRecipientPhase], requestTypeNames[(request.bmRequestType & kDeviceRequestTypeMask) >> kDeviceRequestTypePhase], request.wValue, request.wIndex, hdr->opcode, hdr->len, request.wLength, completion != nullptr);
         if (hdrLen) {
@@ -253,66 +287,180 @@ IOReturn CIntelBTPatcher::newHostDeviceRequest(void *that, IOService *provider, 
 
 #define HCI_EVT_LE_META                               0x3E
 #define HCI_EVT_LE_META_READ_REMOTE_FEATURES_COMPLETE 0x04
+#define HCI_EVT_LE_META_PHY_UPDATE_COMPLETE           0x0C
 
-uint8_t fakePhyUpdateCompleteEvent[8] = {0x3E, 0x06, 0x0C, 0x00, 0x00, 0x00, 0x02, 0x02};
+// evt(1) plen(1) subevent(1) status(1) handle(2)
+#define HCI_EVT_LE_META_MIN_LEN                       6
+#define HCI_EVT_PHY_UPDATE_COMPLETE_LEN               8
 
-static void asyncIOCompletion(void* owner, void* parameter, IOReturn status, uint32_t bytesTransferred)
+// High bit of a stored handle marks "first completion already seen". Real
+// connection handles are 12 bits, so the bit is always free.
+#define FEATURE_HANDLE_SEEN_FLAG                      0x8000
+
+bool CIntelBTPatcher::armFeatureHandle(uint16_t handle)
+{
+    if (_stateLock == nullptr)
+        return false;
+
+    bool armed = false;
+    IOInterruptState state = IOSimpleLockLockDisableInterrupt(_stateLock);
+    for (uint32_t i = 0; i < _pendingFeatureHandleCount; i++) {
+        if ((_pendingFeatureHandles[i] & ~FEATURE_HANDLE_SEEN_FLAG) == handle) {
+            // Already waiting on this handle; re-arm rather than duplicate it.
+            _pendingFeatureHandles[i] = handle;
+            armed = true;
+            break;
+        }
+    }
+    if (!armed && _pendingFeatureHandleCount < kMaxPendingFeatureHandles) {
+        _pendingFeatureHandles[_pendingFeatureHandleCount++] = handle;
+        armed = true;
+    }
+    IOSimpleLockUnlockEnableInterrupt(_stateLock, state);
+    return armed;
+}
+
+bool CIntelBTPatcher::consumeFeatureCompleteForHandle(uint16_t handle)
+{
+    if (_stateLock == nullptr)
+        return false;
+
+    bool rewrite = false;
+    IOInterruptState state = IOSimpleLockLockDisableInterrupt(_stateLock);
+    for (uint32_t i = 0; i < _pendingFeatureHandleCount; i++) {
+        if ((_pendingFeatureHandles[i] & ~FEATURE_HANDLE_SEEN_FLAG) != handle)
+            continue;
+        if (_pendingFeatureHandles[i] & FEATURE_HANDLE_SEEN_FLAG) {
+            // Second completion for this handle: this is the spare one.
+            _pendingFeatureHandles[i] = _pendingFeatureHandles[_pendingFeatureHandleCount - 1];
+            _pendingFeatureHandleCount--;
+            rewrite = true;
+        } else {
+            // First completion carries the real remote features; pass it on.
+            _pendingFeatureHandles[i] |= FEATURE_HANDLE_SEEN_FLAG;
+        }
+        break;
+    }
+    IOSimpleLockUnlockEnableInterrupt(_stateLock, state);
+    return rewrite;
+}
+
+void CIntelBTPatcher::resetFeatureHandles()
+{
+    if (_stateLock == nullptr)
+        return;
+    IOInterruptState state = IOSimpleLockLockDisableInterrupt(_stateLock);
+    _pendingFeatureHandleCount = 0;
+    IOSimpleLockUnlockEnableInterrupt(_stateLock, state);
+}
+
+void CIntelBTPatcher::asyncIOCompletion(void *owner, void *parameter, IOReturn status, uint32_t bytesTransferred)
 {
     AsyncOwnerData *asyncOwner = (AsyncOwnerData *)owner;
-    IOMemoryDescriptor* dataBuffer = asyncOwner->dataBuffer;
-    static bool skipExtraReadRemoteFeaturesComplete = true;
+    if (asyncOwner == nullptr)
+        return;
 
-    if (dataBuffer && bytesTransferred) {
-        void *buffer = IOMalloc(bytesTransferred);
-        dataBuffer->readBytes(0, buffer, bytesTransferred);
-        HciEventHdr *hdr = (HciEventHdr *)buffer;
-        if (hdr->evt == HCI_EVT_LE_META && hdr->data[0] == HCI_EVT_LE_META_READ_REMOTE_FEATURES_COMPLETE) {
-            if (skipExtraReadRemoteFeaturesComplete) {
-                skipExtraReadRemoteFeaturesComplete = false;
-            } else {
-                // Copy Connection Handle
-                fakePhyUpdateCompleteEvent[4] = hdr->data[2];
-                fakePhyUpdateCompleteEvent[5] = hdr->data[3];
-                dataBuffer->writeBytes(0, fakePhyUpdateCompleteEvent, 8);
-                skipExtraReadRemoteFeaturesComplete = true;
+    // Take a copy and release the per-transfer context straight away, so the
+    // wrapper cannot leak no matter which path we take below.
+    IOUSBHostCompletionAction action = asyncOwner->action;
+    void *realOwner = asyncOwner->owner;
+    IOMemoryDescriptor *dataBuffer = asyncOwner->dataBuffer;
+    IOFree(asyncOwner, sizeof(AsyncOwnerData));
+
+    if (dataBuffer != nullptr &&
+        bytesTransferred >= HCI_EVT_LE_META_MIN_LEN &&
+        dataBuffer->getLength() >= HCI_EVT_PHY_UPDATE_COMPLETE_LEN) {
+        uint8_t evtBuf[HCI_EVT_LE_META_MIN_LEN] = {0};
+        if (dataBuffer->readBytes(0, evtBuf, sizeof(evtBuf)) == sizeof(evtBuf)) {
+            const HciEventHdr *hdr = (const HciEventHdr *)evtBuf;
+            // Only touch a complete LE meta event that actually fits in what
+            // the controller sent; anything shorter is left alone.
+            if (hdr->evt == HCI_EVT_LE_META &&
+                (uint32_t)hdr->len + 2 <= bytesTransferred &&
+                hdr->data[0] == HCI_EVT_LE_META_READ_REMOTE_FEATURES_COMPLETE) {
+                uint16_t handle = (uint16_t)(evtBuf[4] | (evtBuf[5] << 8));
+                if (consumeFeatureCompleteForHandle(handle)) {
+                    uint8_t phyUpdateComplete[HCI_EVT_PHY_UPDATE_COMPLETE_LEN] = {
+                        HCI_EVT_LE_META, 0x06, HCI_EVT_LE_META_PHY_UPDATE_COMPLETE,
+                        0x00, evtBuf[4], evtBuf[5], 0x02, 0x02
+                    };
+                    if (dataBuffer->writeBytes(0, phyUpdateComplete, sizeof(phyUpdateComplete)) == sizeof(phyUpdateComplete)) {
+                        // Report the rewritten event's real size rather than the
+                        // longer one the controller sent.
+                        bytesTransferred = HCI_EVT_PHY_UPDATE_COMPLETE_LEN;
+                    }
+                }
             }
         }
-        IOFree(buffer, bytesTransferred);
     }
-    if (asyncOwner->action)
-        asyncOwner->action(asyncOwner->owner, parameter, status, bytesTransferred);
+
+    if (action != nullptr)
+        action(realOwner, parameter, status, bytesTransferred);
 }
 
 IOReturn CIntelBTPatcher::
 newAsyncIO(void *that, IOMemoryDescriptor* dataBuffer, uint32_t bytesTransferred, IOUSBHostCompletion* completion, uint32_t completionTimeoutMs)
 {
-    if (that == _hookPipeInstance && completion) {
-        _interruptPipeAsyncOwner->action = completion->action;
-        _interruptPipeAsyncOwner->owner = completion->owner;
-        _interruptPipeAsyncOwner->dataBuffer = dataBuffer;
-        completion->action = asyncIOCompletion;
-        completion->owner = _interruptPipeAsyncOwner;
+    // One context per transfer: the interrupt pipe keeps several reads in
+    // flight, so a single shared wrapper would hand a completion the wrong
+    // buffer and the wrong caller.
+    AsyncOwnerData *asyncOwner = nullptr;
+    if (that != nullptr && that == _hookPipeInstance &&
+        completion != nullptr && completion->action != nullptr) {
+        asyncOwner = (AsyncOwnerData *)IOMalloc(sizeof(AsyncOwnerData));
+        if (asyncOwner != nullptr) {
+            asyncOwner->owner = completion->owner;
+            asyncOwner->action = completion->action;
+            asyncOwner->dataBuffer = dataBuffer;
+            completion->owner = asyncOwner;
+            completion->action = asyncIOCompletion;
+        }
     }
-    return FunctionCast(newAsyncIO, callbackIBTPatcher->oldAsyncIO)(that, dataBuffer, bytesTransferred, completion, completionTimeoutMs);
+
+    IOReturn ret = FunctionCast(newAsyncIO, callbackIBTPatcher->oldAsyncIO)(that, dataBuffer, bytesTransferred, completion, completionTimeoutMs);
+
+    if (asyncOwner != nullptr && ret != kIOReturnSuccess) {
+        // The completion will never fire, so undo the swap and reclaim it here.
+        completion->owner = asyncOwner->owner;
+        completion->action = asyncOwner->action;
+        IOFree(asyncOwner, sizeof(AsyncOwnerData));
+    }
+    return ret;
 }
 
-#define VENDOR_USB_INTEL 0x8087
+#define VENDOR_USB_INTEL                0x8087
+#define USB_CLASS_WIRELESS_CONTROLLER   0xE0
+#define USB_SUBCLASS_RF_CONTROLLER      0x01
+#define USB_PROTOCOL_BLUETOOTH          0x01
 
 int CIntelBTPatcher::
 newInitPipe(void *that, StandardUSB::EndpointDescriptor const *descriptor, StandardUSB::SuperSpeedEndpointCompanionDescriptor const *superDescriptor, AppleUSBHostController *controller, IOUSBHostDevice *device, IOUSBHostInterface *interface, unsigned char a7, unsigned short a8)
 {
     int ret = FunctionCast(newInitPipe, callbackIBTPatcher->oldInitPipe)(that, descriptor, superDescriptor, controller, device, interface, a7, a8);
-    if (device) {
+    if (device != nullptr && descriptor != nullptr) {
         const StandardUSB::DeviceDescriptor *deviceDescriptor = device->getDeviceDescriptor();
-        if (deviceDescriptor &&
-            deviceDescriptor->idVendor == VENDOR_USB_INTEL) {
+        // Match the Bluetooth function specifically, not merely any Intel USB
+        // device that happens to expose an interrupt endpoint.
+        if (deviceDescriptor != nullptr &&
+            deviceDescriptor->idVendor == VENDOR_USB_INTEL &&
+            deviceDescriptor->bDeviceClass == USB_CLASS_WIRELESS_CONTROLLER &&
+            deviceDescriptor->bDeviceSubClass == USB_SUBCLASS_RF_CONTROLLER &&
+            deviceDescriptor->bDeviceProtocol == USB_PROTOCOL_BLUETOOTH) {
             uint8_t epType = StandardUSB::getEndpointType(descriptor);
             if (epType == kIOUSBEndpointTypeInterrupt) {
-                CIntelBTPatcher::_hookPipeInstance = that;
-                if (!CIntelBTPatcher::_interruptPipeAsyncOwner)
-                    CIntelBTPatcher::_interruptPipeAsyncOwner = new AsyncOwnerData;
-                CIntelBTPatcher::_randomAddressInit = false;
+                _hookPipeInstance = that;
+                _randomAddressInit = false;
+                // The controller is starting over; stale handles mean nothing.
+                resetFeatureHandles();
+                SYSLOG(DRV_NAME, "[PATCH] Hooked Intel Bluetooth interrupt pipe %p", that);
             }
+        } else if (deviceDescriptor != nullptr &&
+                   deviceDescriptor->idVendor == VENDOR_USB_INTEL) {
+            // Makes it obvious if a card reports its Bluetooth function
+            // differently and therefore never gets hooked.
+            DBGLOG(DRV_NAME, "Skipping Intel device %04x class %02x/%02x/%02x",
+                   deviceDescriptor->idProduct, deviceDescriptor->bDeviceClass,
+                   deviceDescriptor->bDeviceSubClass, deviceDescriptor->bDeviceProtocol);
         }
     }
     return ret;
