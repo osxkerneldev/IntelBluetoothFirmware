@@ -10,6 +10,7 @@
 
 #include <Headers/kern_patcher.hpp>
 
+#include <IOKit/IOLocks.h>
 #include <IOKit/usb/IOUSBHostDevice.h>
 
 #define DRV_NAME "ibtp"
@@ -78,6 +79,15 @@ public:
     static IOReturn newAsyncIO(void *that, IOMemoryDescriptor* dataBuffer, uint32_t dataBufferLength, IOUSBHostCompletion* completion, uint32_t completionTimeoutMs);
     static int newInitPipe(void *that, StandardUSB::EndpointDescriptor const *descriptor, StandardUSB::SuperSpeedEndpointCompanionDescriptor const *superDescriptor,AppleUSBHostController *controller, IOUSBHostDevice *device, IOUSBHostInterface *interface, unsigned char, unsigned short);
 
+    static void asyncIOCompletion(void *owner, void *parameter, IOReturn status, uint32_t bytesTransferred);
+    // Returns true when this is the second Read Remote Features Complete seen
+    // for the handle, i.e. the duplicate that may be rewritten.
+    static bool consumeFeatureCompleteForHandle(uint16_t handle);
+    // Called once the duplicate command really went out, so a completion is
+    // only ever rewritten when a second one is genuinely expected.
+    static bool armFeatureHandle(uint16_t handle);
+    static void resetFeatureHandles();
+
     
     mach_vm_address_t oldFindQueueRequest {};
     mach_vm_address_t oldHostDeviceRequest {};
@@ -85,8 +95,14 @@ public:
     mach_vm_address_t oldInitPipe {};
     
 private:
+    // Bounded: concurrent LE connections are few, and a full table just means
+    // events are passed through untouched.
+    static constexpr uint32_t kMaxPendingFeatureHandles = 8;
+
     static void *_hookPipeInstance;
-    static AsyncOwnerData *_interruptPipeAsyncOwner;
+    static IOSimpleLock *_stateLock;
+    static uint16_t _pendingFeatureHandles[kMaxPendingFeatureHandles];
+    static uint32_t _pendingFeatureHandleCount;
     static bool _randomAddressInit;
 };
 
