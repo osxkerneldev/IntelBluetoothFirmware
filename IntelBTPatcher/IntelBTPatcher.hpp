@@ -21,6 +21,9 @@ typedef struct {
     void *owner;
     IOMemoryDescriptor *dataBuffer;
     IOUSBHostCompletionAction action;
+    // True while this transfer holds an extra prepare() on dataBuffer, which is
+    // what makes the buffer safe to read from the completion.
+    bool prepared;
 } AsyncOwnerData;
 
 typedef struct __attribute__((packed))
@@ -77,7 +80,11 @@ public:
     
     static IOReturn newHostDeviceRequest(void *that, IOService *provider, StandardUSB::DeviceRequest &request, void *data, IOMemoryDescriptor *descriptor, unsigned int &length,IOUSBHostCompletion *completion, unsigned int timeout);
     static IOReturn newAsyncIO(void *that, IOMemoryDescriptor* dataBuffer, uint32_t dataBufferLength, IOUSBHostCompletion* completion, uint32_t completionTimeoutMs);
-    static int newInitPipe(void *that, StandardUSB::EndpointDescriptor const *descriptor, StandardUSB::SuperSpeedEndpointCompanionDescriptor const *superDescriptor,AppleUSBHostController *controller, IOUSBHostDevice *device, IOUSBHostInterface *interface, unsigned char, unsigned short);
+    // The second parameter is a SuperSpeedEndpointCompanionDescriptor up to
+    // macOS 15 and a ConfigurationDescriptor from macOS 26 on, which changes the
+    // mangled name. It is never dereferenced here, so keep it type-agnostic and
+    // let one routine serve both signatures.
+    static int newInitPipe(void *that, StandardUSB::EndpointDescriptor const *descriptor, const void *companionOrConfigDescriptor, AppleUSBHostController *controller, IOUSBHostDevice *device, IOUSBHostInterface *interface, unsigned char, unsigned short);
 
     static void asyncIOCompletion(void *owner, void *parameter, IOReturn status, uint32_t bytesTransferred);
     // Returns true when this is the second Read Remote Features Complete seen
