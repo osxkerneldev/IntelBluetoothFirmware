@@ -158,18 +158,32 @@ void CIntelBTPatcher::processKext(KernelPatcher &patcher, size_t index, mach_vm_
                 patcher.clearError();
             }
 
-            KernelPatcher::RouteRequest initPipeRequest {
-            "__ZN13IOUSBHostPipe28initWithDescriptorsAndOwnersEPKN11StandardUSB18EndpointDescriptorEPKNS0_37SuperSpeedEndpointCompanionDescriptorEP22AppleUSBHostControllerP15IOUSBHostDeviceP18IOUSBHostInterfaceht",
-                newInitPipe,
-                oldInitPipe
+            // macOS 26 replaced the SuperSpeedEndpointCompanionDescriptor
+            // parameter with a ConfigurationDescriptor, so the mangled name
+            // differs. Try the current spelling first, then the legacy one;
+            // without this route _hookPipeInstance is never set and no HCI
+            // event is ever rewritten.
+            static const char *initPipeSymbols[] {
+                "__ZN13IOUSBHostPipe28initWithDescriptorsAndOwnersEPKN11StandardUSB18EndpointDescriptorEPKNS0_23ConfigurationDescriptorEP22AppleUSBHostControllerP15IOUSBHostDeviceP18IOUSBHostInterfaceht",
+                "__ZN13IOUSBHostPipe28initWithDescriptorsAndOwnersEPKN11StandardUSB18EndpointDescriptorEPKNS0_37SuperSpeedEndpointCompanionDescriptorEP22AppleUSBHostControllerP15IOUSBHostDeviceP18IOUSBHostInterfaceht",
             };
-            patcher.routeMultiple(index, &initPipeRequest, 1, address, size);
-            if (patcher.getError() == KernelPatcher::Error::NoError) {
-                SYSLOG(DRV_NAME, "routed %s", initPipeRequest.symbol);
-            } else {
-                SYSLOG(DRV_NAME, "failed to resolve %s, error = %d", initPipeRequest.symbol, patcher.getError());
-                patcher.clearError();
+            bool initPipeRouted = false;
+            for (size_t i = 0; i < arrsize(initPipeSymbols) && !initPipeRouted; i++) {
+                KernelPatcher::RouteRequest initPipeRequest {
+                    initPipeSymbols[i],
+                    newInitPipe,
+                    oldInitPipe
+                };
+                patcher.routeMultiple(index, &initPipeRequest, 1, address, size);
+                if (patcher.getError() == KernelPatcher::Error::NoError) {
+                    SYSLOG(DRV_NAME, "routed %s", initPipeRequest.symbol);
+                    initPipeRouted = true;
+                } else {
+                    patcher.clearError();
+                }
             }
+            if (!initPipeRouted)
+                SYSLOG(DRV_NAME, "failed to resolve any initWithDescriptorsAndOwners variant, LE PHY workaround disabled");
         }
     }
 }
@@ -365,33 +379,41 @@ void CIntelBTPatcher::asyncIOCompletion(void *owner, void *parameter, IOReturn s
     IOUSBHostCompletionAction action = asyncOwner->action;
     void *realOwner = asyncOwner->owner;
     IOMemoryDescriptor *dataBuffer = asyncOwner->dataBuffer;
+    bool prepared = asyncOwner->prepared;
     IOFree(asyncOwner, sizeof(AsyncOwnerData));
 
-    if (dataBuffer != nullptr &&
-        bytesTransferred >= HCI_EVT_LE_META_MIN_LEN &&
-        dataBuffer->getLength() >= HCI_EVT_PHY_UPDATE_COMPLETE_LEN) {
-        uint8_t evtBuf[HCI_EVT_LE_META_MIN_LEN] = {0};
-        if (dataBuffer->readBytes(0, evtBuf, sizeof(evtBuf)) == sizeof(evtBuf)) {
-            const HciEventHdr *hdr = (const HciEventHdr *)evtBuf;
-            // Only touch a complete LE meta event that actually fits in what
-            // the controller sent; anything shorter is left alone.
-            if (hdr->evt == HCI_EVT_LE_META &&
-                (uint32_t)hdr->len + 2 <= bytesTransferred &&
-                hdr->data[0] == HCI_EVT_LE_META_READ_REMOTE_FEATURES_COMPLETE) {
-                uint16_t handle = (uint16_t)(evtBuf[4] | (evtBuf[5] << 8));
-                if (consumeFeatureCompleteForHandle(handle)) {
-                    uint8_t phyUpdateComplete[HCI_EVT_PHY_UPDATE_COMPLETE_LEN] = {
-                        HCI_EVT_LE_META, 0x06, HCI_EVT_LE_META_PHY_UPDATE_COMPLETE,
-                        0x00, evtBuf[4], evtBuf[5], 0x02, 0x02
-                    };
-                    if (dataBuffer->writeBytes(0, phyUpdateComplete, sizeof(phyUpdateComplete)) == sizeof(phyUpdateComplete)) {
-                        // Report the rewritten event's real size rather than the
-                        // longer one the controller sent.
-                        bytesTransferred = HCI_EVT_PHY_UPDATE_COMPLETE_LEN;
+    // AppleUSBIORequest::complete() unwires the descriptor before invoking this
+    // action, and reading an unwired descriptor panics inside
+    // getPhysicalSegment(). Only the extra prepare() taken in newAsyncIO makes
+    // the buffer safe to touch here.
+    if (prepared && dataBuffer != nullptr) {
+        if (bytesTransferred >= HCI_EVT_LE_META_MIN_LEN &&
+            dataBuffer->getLength() >= HCI_EVT_PHY_UPDATE_COMPLETE_LEN) {
+            uint8_t evtBuf[HCI_EVT_LE_META_MIN_LEN] = {0};
+            if (dataBuffer->readBytes(0, evtBuf, sizeof(evtBuf)) == sizeof(evtBuf)) {
+                const HciEventHdr *hdr = (const HciEventHdr *)evtBuf;
+                // Only touch a complete LE meta event that actually fits in what
+                // the controller sent; anything shorter is left alone.
+                if (hdr->evt == HCI_EVT_LE_META &&
+                    (uint32_t)hdr->len + 2 <= bytesTransferred &&
+                    hdr->data[0] == HCI_EVT_LE_META_READ_REMOTE_FEATURES_COMPLETE) {
+                    uint16_t handle = (uint16_t)(evtBuf[4] | (evtBuf[5] << 8));
+                    if (consumeFeatureCompleteForHandle(handle)) {
+                        uint8_t phyUpdateComplete[HCI_EVT_PHY_UPDATE_COMPLETE_LEN] = {
+                            HCI_EVT_LE_META, 0x06, HCI_EVT_LE_META_PHY_UPDATE_COMPLETE,
+                            0x00, evtBuf[4], evtBuf[5], 0x02, 0x02
+                        };
+                        if (dataBuffer->writeBytes(0, phyUpdateComplete, sizeof(phyUpdateComplete)) == sizeof(phyUpdateComplete)) {
+                            // Report the rewritten event's real size rather than
+                            // the longer one the controller sent.
+                            bytesTransferred = HCI_EVT_PHY_UPDATE_COMPLETE_LEN;
+                        }
                     }
                 }
             }
         }
+        // Release our wire reference before handing control back.
+        dataBuffer->complete();
     }
 
     if (action != nullptr)
@@ -405,24 +427,36 @@ newAsyncIO(void *that, IOMemoryDescriptor* dataBuffer, uint32_t bytesTransferred
     // flight, so a single shared wrapper would hand a completion the wrong
     // buffer and the wrong caller.
     AsyncOwnerData *asyncOwner = nullptr;
-    if (that != nullptr && that == _hookPipeInstance &&
+    if (that != nullptr && that == _hookPipeInstance && dataBuffer != nullptr &&
         completion != nullptr && completion->action != nullptr) {
-        asyncOwner = (AsyncOwnerData *)IOMalloc(sizeof(AsyncOwnerData));
-        if (asyncOwner != nullptr) {
-            asyncOwner->owner = completion->owner;
-            asyncOwner->action = completion->action;
-            asyncOwner->dataBuffer = dataBuffer;
-            completion->owner = asyncOwner;
-            completion->action = asyncIOCompletion;
+        // Hold our own prepare() for the lifetime of the transfer. The USB
+        // stack completes the descriptor before calling the completion action,
+        // so without this the buffer is unwired by the time we look at it and
+        // readBytes() panics. prepare()/complete() nest by wire count, so this
+        // only keeps the buffer wired marginally longer than the stack does.
+        if (dataBuffer->prepare() == kIOReturnSuccess) {
+            asyncOwner = (AsyncOwnerData *)IOMalloc(sizeof(AsyncOwnerData));
+            if (asyncOwner != nullptr) {
+                asyncOwner->owner = completion->owner;
+                asyncOwner->action = completion->action;
+                asyncOwner->dataBuffer = dataBuffer;
+                asyncOwner->prepared = true;
+                completion->owner = asyncOwner;
+                completion->action = asyncIOCompletion;
+            } else {
+                dataBuffer->complete();
+            }
         }
     }
 
     IOReturn ret = FunctionCast(newAsyncIO, callbackIBTPatcher->oldAsyncIO)(that, dataBuffer, bytesTransferred, completion, completionTimeoutMs);
 
     if (asyncOwner != nullptr && ret != kIOReturnSuccess) {
-        // The completion will never fire, so undo the swap and reclaim it here.
+        // The completion will never fire, so undo the swap, drop our wire
+        // reference and reclaim the context here.
         completion->owner = asyncOwner->owner;
         completion->action = asyncOwner->action;
+        dataBuffer->complete();
         IOFree(asyncOwner, sizeof(AsyncOwnerData));
     }
     return ret;
@@ -434,9 +468,9 @@ newAsyncIO(void *that, IOMemoryDescriptor* dataBuffer, uint32_t bytesTransferred
 #define USB_PROTOCOL_BLUETOOTH          0x01
 
 int CIntelBTPatcher::
-newInitPipe(void *that, StandardUSB::EndpointDescriptor const *descriptor, StandardUSB::SuperSpeedEndpointCompanionDescriptor const *superDescriptor, AppleUSBHostController *controller, IOUSBHostDevice *device, IOUSBHostInterface *interface, unsigned char a7, unsigned short a8)
+newInitPipe(void *that, StandardUSB::EndpointDescriptor const *descriptor, const void *companionOrConfigDescriptor, AppleUSBHostController *controller, IOUSBHostDevice *device, IOUSBHostInterface *interface, unsigned char a7, unsigned short a8)
 {
-    int ret = FunctionCast(newInitPipe, callbackIBTPatcher->oldInitPipe)(that, descriptor, superDescriptor, controller, device, interface, a7, a8);
+    int ret = FunctionCast(newInitPipe, callbackIBTPatcher->oldInitPipe)(that, descriptor, companionOrConfigDescriptor, controller, device, interface, a7, a8);
     if (device != nullptr && descriptor != nullptr) {
         const StandardUSB::DeviceDescriptor *deviceDescriptor = device->getDeviceDescriptor();
         // Match the Bluetooth function specifically, not merely any Intel USB
